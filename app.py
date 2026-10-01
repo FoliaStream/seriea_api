@@ -5,6 +5,8 @@ from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 import os
 from flask_cors import CORS
+import requests as http_requests
+import secrets
 import uuid
 import json
 from player_attribution import (
@@ -30,6 +32,11 @@ if not JWT_SECRET:
     raise RuntimeError("JWT_SECRET environment variable is not set")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24 * 7  # 1 week
+FROM_NAME = os.environ.get("FROM_NAME", "FantaLeague")
+FROM_EMAIL = os.environ.get("FROM_EMAIL")
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+RESET_TOKEN_EXPIRY_MINUTES = 30
 
 
 def create_token(user_id):
@@ -77,10 +84,13 @@ def get_all():
 def register():
     data = request.get_json()
     username = (data.get("username") or "").strip()
+    email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
 
     if not username or not password:
         return jsonify({"error": "Username and password are required"}), 400
+    if not email or "@" not in email:
+        return jsonify({"error": "A valid email is required"}), 400
     if len(password) < 8:
         return jsonify({"error": "Password must be at least 8 characters"}), 400
 
@@ -89,13 +99,14 @@ def register():
     try:
         with engine.begin() as conn:
             result = conn.execute(text("""
-                INSERT INTO users (username, password_hash)
-                VALUES (:username, :password_hash)
+                INSERT INTO users (username, email, password_hash)
+                VALUES (:username, :email, :password_hash)
                 RETURNING id
-            """), {"username": username, "password_hash": password_hash})
+            """), {"username": username, "email": email, "password_hash": password_hash})
             user_id = result.scalar()
     except Exception:
-        return jsonify({"error": "Username already taken"}), 409
+        # unique constraint could be on username OR email
+        return jsonify({"error": "Username or email already taken"}), 409
 
     token = create_token(user_id)
     return jsonify({"token": token, "username": username}), 201
@@ -118,6 +129,72 @@ def login():
     token = create_token(row["id"])
     return jsonify({"token": token, "username": username})
 
+@app.post("/auth/forgot-password")
+def forgot_password():
+    data = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT id FROM users WHERE LOWER(email) = :email
+        """), {"email": email}).mappings().first()
+
+    # Always return the same response — don't reveal whether the email exists.
+    if row is None:
+        return jsonify({"message": "If that email is registered, we've sent a reset link."}), 200
+
+    token = create_reset_token(row["id"])
+    reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
+
+    try:
+        send_reset_email(email, reset_link)
+    except Exception as e:
+        # log server-side, but still return 200 so we don't leak whether the email exists
+        print(f"Failed to send reset email to {email}: {e}")
+        return jsonify({"message": "If that email is registered, we've sent a reset link."}), 200
+
+    return jsonify({"message": "If that email is registered, we've sent a reset link."}), 200
+
+
+@app.post("/auth/reset-password")
+def reset_password():
+    data = request.get_json() or {}
+    token = data.get("token") or ""
+    new_password = data.get("password") or ""
+
+    if not token or not new_password:
+        return jsonify({"error": "Token and password are required"}), 400
+    if len(new_password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "This reset link has expired. Request a new one."}), 400
+    except jwt.InvalidTokenError:
+        return jsonify({"error": "Invalid reset link"}), 400
+
+    if payload.get("purpose") != "reset":
+        return jsonify({"error": "Invalid reset link"}), 400
+
+    user_id = payload.get("user_id")
+
+    with engine.begin() as conn:
+        row = conn.execute(text(
+            "SELECT id FROM users WHERE id = :id"
+        ), {"id": user_id}).mappings().first()
+
+        if row is None:
+            return jsonify({"error": "Invalid reset link"}), 400
+
+        conn.execute(text(
+            "UPDATE users SET password_hash = :hash WHERE id = :id"
+        ), {"hash": generate_password_hash(new_password), "id": user_id})
+
+    return jsonify({"message": "Password updated. You can now sign in."}), 200
 
 # ---- Teams ----
 
@@ -126,20 +203,12 @@ def login():
 def get_teams():
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT id, name, player_ids, user_id
+            SELECT id, name, player_ids
             FROM teams
-            WHERE user_id IS NULL OR user_id = :user_id
+            WHERE user_id = :user_id
             ORDER BY created_at
         """), {"user_id": request.user_id}).mappings().all()
-
-    teams = []
-    for r in rows:
-        team = dict(r)
-        team["is_shared"] = team["user_id"] is None
-        team["is_owner"] = team["user_id"] == request.user_id
-        del team["user_id"]
-        teams.append(team)
-    return jsonify(teams)
+    return jsonify([dict(r) for r in rows])
 
 @app.post("/teams")
 @require_auth
@@ -271,6 +340,47 @@ def get_lineups():
         }
 
     return jsonify({"season": season, "giornata": giornata, "clubs": clubs})
+
+def create_reset_token(user_id):
+    """A short-lived JWT that can ONLY be used to reset a password."""
+    payload = {
+        "user_id": user_id,
+        "purpose": "reset",  # distinguishes this from a login token
+        "jti": secrets.token_urlsafe(16),  # unique id, for logging/debugging
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=RESET_TOKEN_EXPIRY_MINUTES),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def send_reset_email(to_email, reset_link):
+    """Send the reset link via Brevo. Raises on failure."""
+    if not BREVO_API_KEY:
+        raise RuntimeError("BREVO_API_KEY is not set")
+    if not FROM_EMAIL:
+        raise RuntimeError("FROM_EMAIL is not set")
+
+    resp = http_requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={
+            "api-key": BREVO_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json={
+            "sender": {"name": FROM_NAME, "email": FROM_EMAIL},
+            "to": [{"email": to_email}],
+            "subject": "Reset your FantaLeague password",
+            "htmlContent": f"""
+                <p>Someone requested a password reset for your FantaLeague account.</p>
+                <p><a href="{reset_link}">Click here to set a new password</a></p>
+                <p>This link expires in {RESET_TOKEN_EXPIRY_MINUTES} minutes.</p>
+                <p>If you didn't request this, you can safely ignore this email.</p>
+            """,
+        },
+        timeout=10,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Brevo error {resp.status_code}: {resp.text[:200]}")
 
 if __name__ == "__main__":
     app.run(debug=True)
