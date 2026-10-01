@@ -270,6 +270,7 @@ def simulate():
     season = data.get("season", "2026-27")
     giornata = data.get("giornata")
     sims = int(data.get("sims", 1000))
+    sims = max(1, min(sims, 1000))   
     seed = data.get("seed")           # optional
     lineups = data.get("lineups")     # optional: {club: [player_id, ...]}
 
